@@ -2,7 +2,10 @@ import * as readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import OpenAI from 'openai';
 import { loadConfig} from './config.ts';
+import { runAgentTurn } from './agent.ts';
 
+const SYSTEM_PROMPT =
+  '你是一个运行在终端里的 Coding Agent。当用户询问当前项目的问题时，不要凭空猜测，先调用 list_dir 和 read_file 查看实际文件后再回答。请用简洁清晰的中文回复。';
 const Config = loadConfig();
 
 const apiKey = Config.apiKey;
@@ -42,32 +45,19 @@ try {
     if (userInput === '/exit' || userInput === 'exit') {
       break;
     }
-    // 1. 记录用户输入
+    const savedHistoryLength = history.length;
     history.push({ role: 'user', content: userInput });
-    try {
-        // 2. 把完整 history 发给 Responses API
-        const stream = await client.responses.create({
-        model,
-        instructions: '你是个美女',
-        input: history,
-        stream: true,
-        store: false,
-        });
-        process.stdout.write('AI> ');
-        let assistantText = '';
-        for await (const event of stream) {
-        if (event.type === 'response.output_text.delta') {
-            process.stdout.write(event.delta);
-            assistantText += event.delta;
-        }
-        }
-        process.stdout.write('\n');
 
-        if (assistantText) {
-        history.push({ role: 'assistant', content: assistantText });
-        }
+    try {
+      await runAgentTurn({
+        client,
+        model,
+        instructions: SYSTEM_PROMPT,
+        history,
+      });
     } catch (error: unknown) {
-      history.pop();
+      // 整轮原子回滚，防止半截 function_call 污染上下文
+      history.length = savedHistoryLength;
       const message = error instanceof Error ? error.message : String(error);
       console.error(`\n[请求失败] ${message}`);
     }
