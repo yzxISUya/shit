@@ -43,12 +43,46 @@ export const toolDefinitions: OpenAI.Responses.FunctionTool[] = [
     },
     strict: false,
   },
+  {
+    type: 'function',
+    name: 'search_text',
+    description: '在项目文件中递归搜索指定文本（不区分大小写），返回匹配的文件路径、行号和该行内容',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: '要搜索的关键词文本',
+        },
+        dirPath: {
+          type: 'string',
+          description: '限制搜索的起始目录（相对项目根目录），不传则搜索整个项目 "."',
+        },
+      },
+      required: ['query'],
+    },
+    strict: false,
+  },
 ];
 
-const IGNORED_DIRS = new Set(['node_modules', '.git']);
+const IGNORED_DIRS = new Set(['node_modules', '.git', '.env']);
+const WORKSPACE_ROOT = path.resolve(process.cwd());
+
+export function resolveSafePath(inputPath: string): string {
+  const resolved = path.resolve(WORKSPACE_ROOT, inputPath);
+  const relative = path.relative(WORKSPACE_ROOT, resolved);
+  if (
+    relative === '..' ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw new Error(`安全拦截：不允许访问工作区之外的路径 (${inputPath})`);
+  }
+  return resolved;
+}
 
 async function listDir(dirPath: string): Promise<string> {
-  const targetDir = path.resolve(process.cwd(), dirPath);
+  const targetDir = resolveSafePath(dirPath);
   const entries = await fs.readdir(targetDir, { withFileTypes: true });
 
   const lines = entries
@@ -67,7 +101,7 @@ async function readFileWithLines(
   startLine?: number,
   endLine?: number,
 ): Promise<string> {
-  const targetFile = path.resolve(process.cwd(), filePath);
+  const targetFile = resolveSafePath(filePath);
   const content = await fs.readFile(targetFile, 'utf-8');
   const allLines = content.split(/\r?\n/);
 
@@ -87,6 +121,70 @@ async function readFileWithLines(
   }
 
   return `文件: ${filePath} (第 ${start}-${end} 行 / 共 ${allLines.length} 行)\n${numbered.join('\n')}`;
+}
+
+const MAX_SEARCH_RESULTS = 50;
+const MAX_SEARCH_FILE_BYTES = 1024 * 1024; // 跳过超过 1MB 的文件
+
+async function searchText(query: string, dirPath: string): Promise<string> {
+  const startDir = resolveSafePath(dirPath);
+  const matches: string[] = [];
+  const lowerQuery = query.toLowerCase();
+
+  async function walk(currentDir: string): Promise<void> {
+    if (matches.length >= MAX_SEARCH_RESULTS) {
+      return;
+    }
+
+    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (matches.length >= MAX_SEARCH_RESULTS) {
+        return;
+      }
+      if (IGNORED_DIRS.has(entry.name) || entry.name === '.env') {
+        continue;
+      }
+
+      const fullPath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(fullPath);
+      } else if (entry.isFile()) {
+        const stat = await fs.stat(fullPath);
+        if (stat.size > MAX_SEARCH_FILE_BYTES) {
+          continue;
+        }
+
+        const content = await fs.readFile(fullPath, 'utf-8');
+        // 简单跳过二进制文件（二进制内容通常包含空字节 \0）
+        if (content.includes('\0')) {
+          continue;
+        }
+
+        const lines = content.split(/\r?\n/);
+        const relPath = path.relative(WORKSPACE_ROOT, fullPath);
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i] ?? '';
+          if (line.toLowerCase().includes(lowerQuery)) {
+            matches.push(`${relPath}:${i + 1}: ${line.trim()}`);
+            if (matches.length >= MAX_SEARCH_RESULTS) {
+              return;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  await walk(startDir);
+
+  if (matches.length === 0) {
+    return `未找到包含 "${query}" 的内容。`;
+  }
+  const suffix =
+    matches.length >= MAX_SEARCH_RESULTS
+      ? `\n... (已达到单次最大显示条数 ${MAX_SEARCH_RESULTS}，请缩小搜索范围)`
+      : '';
+  return matches.join('\n') + suffix;
 }
 
 // 统一调度入口：解析参数、校验类型、捕获异常并返回字符串给模型
@@ -120,6 +218,18 @@ export async function executeTool(name: string, rawArgs: string): Promise<string
       const startLine = typeof args['startLine'] === 'number' ? args['startLine'] : undefined;
       const endLine = typeof args['endLine'] === 'number' ? args['endLine'] : undefined;
       return await readFileWithLines(filePath.trim(), startLine, endLine);
+    }
+
+    if (name === 'search_text') {
+      const query = args['query'];
+      if (typeof query !== 'string' || !query.trim()) {
+        return '工具参数错误：search_text 必须提供非空字符串 query';
+      }
+      const dirPath =
+        typeof args['dirPath'] === 'string' && args['dirPath'].trim()
+          ? args['dirPath'].trim()
+          : '.';
+      return await searchText(query.trim(), dirPath);
     }
 
     return `未知工具：${name}`;
