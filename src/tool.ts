@@ -84,6 +84,31 @@ export const toolDefinitions: OpenAI.Responses.FunctionTool[] = [
     },
     strict: false,
   },
+  {
+    type: 'function',
+    name: 'edit_file',
+    description:
+      '精准局部修改已有文件：用 newText 替换文件中唯一匹配的 oldText。修改前请先调用 read_file 确认上下文；若 oldText 不存在或匹配多处，会报错而不修改文件',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: {
+          type: 'string',
+          description: '要编辑的文件路径（相对当前项目根目录）',
+        },
+        oldText: {
+          type: 'string',
+          description: '文件中要被替换的原始文本片段，必须与文件内容精确一致且在文件中唯一',
+        },
+        newText: {
+          type: 'string',
+          description: '替换后的新文本（传空字符串 "" 表示删除 oldText）',
+        },
+      },
+      required: ['filePath', 'oldText', 'newText'],
+    },
+    strict: false,
+  },
 ];
 
 const WORKSPACE_ROOT = path.resolve(process.cwd());
@@ -127,7 +152,7 @@ async function listDir(dirPath: string): Promise<string> {
   const entries = await fs.readdir(targetDir, { withFileTypes: true });
 
   const lines = entries
-    .filter((entry) => !isSecretSegment(entry.name))
+    .filter((entry) => !isSecretSegment(entry.name) && !IGNORED_DIRS.has(entry.name.toLowerCase()))
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name));
 
@@ -182,7 +207,7 @@ async function searchText(query: string, dirPath: string): Promise<string> {
       if (matches.length >= MAX_SEARCH_RESULTS) {
         return;
       }
-      if (isSecretSegment(entry.name)) {
+      if (isSecretSegment(entry.name) || IGNORED_DIRS.has(entry.name.toLowerCase())) {
         continue;
       }
 
@@ -229,7 +254,7 @@ async function searchText(query: string, dirPath: string): Promise<string> {
 }
 
 async function writeFileContent(filePath: string, content: string): Promise<string> {
-  const targetFile = resolveSafePath(filePath);
+  const targetFile = resolveSafePath(filePath, 'write');
 
   let existed = true;
   try {
@@ -245,6 +270,61 @@ async function writeFileContent(filePath: string, content: string): Promise<stri
   const byteCount = Buffer.byteLength(content, 'utf-8');
   const action = existed ? '已覆写' : '已创建';
   return `${action}文件: ${filePath}（共 ${lineCount} 行，${byteCount} 字节）`;
+}
+
+async function editFileContent(
+  filePath: string,
+  oldText: string,
+  newText: string,
+): Promise<string> {
+  const targetFile = resolveSafePath(filePath, 'write');
+  const rawContent = await fs.readFile(targetFile, 'utf-8');
+
+  // 保留原文件换行风格（Windows CRLF 或 Unix LF），内部统一按 LF 匹配
+  const eol = rawContent.includes('\r\n') ? '\r\n' : '\n';
+  const normalizedContent = rawContent.replaceAll('\r\n', '\n');
+  const normalizedOld = oldText.replaceAll('\r\n', '\n');
+  const normalizedNew = newText.replaceAll('\r\n', '\n');
+
+  if (normalizedOld === normalizedNew) {
+    return `未执行修改：oldText 与 newText 内容完全一致 (${filePath})`;
+  }
+
+  const firstIndex = normalizedContent.indexOf(normalizedOld);
+  if (firstIndex === -1) {
+    return `编辑失败：在 ${filePath} 中未找到指定的 oldText。请先调用 read_file 查看最新内容，确保字符与缩进完全一致后重试。`;
+  }
+
+  // 检查是否存在第二处匹配（用 +1 而非 +length，连重叠片段也能检出）
+  const secondIndex = normalizedContent.indexOf(normalizedOld, firstIndex + 1);
+  if (secondIndex !== -1) {
+    let count = 2;
+    let searchFrom = secondIndex + 1;
+    while (true) {
+      const nextIndex = normalizedContent.indexOf(normalizedOld, searchFrom);
+      if (nextIndex === -1) break;
+      count++;
+      searchFrom = nextIndex + 1;
+    }
+    return `编辑失败：在 ${filePath} 中找到了 ${count} 处相同的 oldText，无法确定要修改哪一处。请在 oldText 中多包含几行上下文，使其在文件中唯一。`;
+  }
+
+  // 用 slice 拼接而不是 replace，避免 newText 里的 $& / $$ 被误解析
+  const updatedNormalized =
+    normalizedContent.slice(0, firstIndex) +
+    normalizedNew +
+    normalizedContent.slice(firstIndex + normalizedOld.length);
+
+  const finalContent =
+    eol === '\r\n' ? updatedNormalized.replaceAll('\n', '\r\n') : updatedNormalized;
+
+  await fs.writeFile(targetFile, finalContent, 'utf-8');
+
+  // 计算行号与行数摘要返回给模型
+  const startLine = normalizedContent.slice(0, firstIndex).split('\n').length;
+  const oldLineCount = normalizedOld.split('\n').length;
+  const newLineCount = normalizedNew === '' ? 0 : normalizedNew.split('\n').length;
+  return `已编辑文件: ${filePath}（从第 ${startLine} 行起，原 ${oldLineCount} 行替换为 ${newLineCount} 行）`;
 }
 
 // 统一调度入口：解析参数、校验类型、捕获异常并返回字符串给模型
@@ -302,6 +382,22 @@ export async function executeTool(name: string, rawArgs: string): Promise<string
         return '工具参数错误：write_file 必须提供字符串类型的 content';
       }
       return await writeFileContent(filePath.trim(), content);
+    }
+
+    if (name === 'edit_file') {
+      const filePath = args['filePath'];
+      if (typeof filePath !== 'string' || !filePath.trim()) {
+        return '工具参数错误：edit_file 必须提供非空字符串 filePath';
+      }
+      const oldText = args['oldText'];
+      if (typeof oldText !== 'string' || oldText.length === 0) {
+        return '工具参数错误：edit_file 必须提供非空字符串 oldText';
+      }
+      const newText = args['newText'];
+      if (typeof newText !== 'string') {
+        return '工具参数错误：edit_file 必须提供字符串类型的 newText';
+      }
+      return await editFileContent(filePath.trim(), oldText, newText);
     }
 
     return `未知工具：${name}`;

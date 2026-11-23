@@ -4,8 +4,14 @@ import OpenAI from 'openai';
 import { loadConfig} from './config.ts';
 import { runAgentTurn } from './agent.ts';
 
-const SYSTEM_PROMPT =
-  '你是一个运行在终端里的 Coding Agent。当用户询问当前项目的问题时，不要凭空猜测，先调用 list_dir 和 read_file 查看实际文件后再回答。请用简洁清晰的中文回复。';
+const SYSTEM_PROMPT = [
+  '你是一个运行在终端里的 Coding Agent，请用简洁清晰的中文回复。',
+  '工作原则：',
+  '1. 回答项目问题或修改代码前，先用 list_dir、search_text、read_file 查看真实文件，不要凭空猜测。',
+  '2. 局部修改已有文件时优先使用 edit_file；只有在新建文件或需要重写整个文件时才使用 write_file。',
+  '3. 工具返回错误时（例如 oldText 未匹配或匹配多处），根据报错调整上下文并重试，不要直接放弃。',
+].join('\n');
+
 const Config = loadConfig();
 
 const apiKey = Config.apiKey;
