@@ -63,10 +63,39 @@ export const toolDefinitions: OpenAI.Responses.FunctionTool[] = [
     },
     strict: false,
   },
+  {
+    type: 'function',
+    name: 'write_file',
+    description:
+      '创建新文件或完整覆写已有文件（自动创建不存在的父目录）。仅用于新建文件或整文件重写；局部修改已有文件请优先使用 edit_file',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: {
+          type: 'string',
+          description: '要写入的文件路径（相对当前项目根目录）',
+        },
+        content: {
+          type: 'string',
+          description: '要写入的完整文本内容',
+        },
+      },
+      required: ['filePath', 'content'],
+    },
+    strict: false,
+  },
 ];
 
-const IGNORED_DIRS = new Set(['node_modules', '.git', '.env']);
 const WORKSPACE_ROOT = path.resolve(process.cwd());
+
+function isBlockedSegment(segment: string): boolean {
+  const lower = segment.toLowerCase();
+  // 拦截 .env 及 .env.local 等私密文件，但放行公开模板 .env.example
+  if (lower === '.env' || (lower.startsWith('.env.') && lower !== '.env.example')) {
+    return true;
+  }
+  return false;
+}
 
 export function resolveSafePath(inputPath: string): string {
   const resolved = path.resolve(WORKSPACE_ROOT, inputPath);
@@ -78,6 +107,11 @@ export function resolveSafePath(inputPath: string): string {
   ) {
     throw new Error(`安全拦截：不允许访问工作区之外的路径 (${inputPath})`);
   }
+
+  const segments = relative.split(path.sep);
+  if (segments.some(isBlockedSegment)) {
+    throw new Error(`安全拦截：不允许访问敏感路径 (${inputPath})`);
+  }
   return resolved;
 }
 
@@ -86,7 +120,7 @@ async function listDir(dirPath: string): Promise<string> {
   const entries = await fs.readdir(targetDir, { withFileTypes: true });
 
   const lines = entries
-    .filter((entry) => !IGNORED_DIRS.has(entry.name))
+    .filter((entry) => !isBlockedSegment(entry.name))
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name));
 
@@ -141,7 +175,7 @@ async function searchText(query: string, dirPath: string): Promise<string> {
       if (matches.length >= MAX_SEARCH_RESULTS) {
         return;
       }
-      if (IGNORED_DIRS.has(entry.name) || entry.name === '.env') {
+      if (isBlockedSegment(entry.name)) {
         continue;
       }
 
@@ -187,6 +221,25 @@ async function searchText(query: string, dirPath: string): Promise<string> {
   return matches.join('\n') + suffix;
 }
 
+async function writeFileContent(filePath: string, content: string): Promise<string> {
+  const targetFile = resolveSafePath(filePath);
+
+  let existed = true;
+  try {
+    await fs.access(targetFile);
+  } catch {
+    existed = false;
+  }
+
+  await fs.mkdir(path.dirname(targetFile), { recursive: true });
+  await fs.writeFile(targetFile, content, 'utf-8');
+
+  const lineCount = content === '' ? 0 : content.split(/\r?\n/).length;
+  const byteCount = Buffer.byteLength(content, 'utf-8');
+  const action = existed ? '已覆写' : '已创建';
+  return `${action}文件: ${filePath}（共 ${lineCount} 行，${byteCount} 字节）`;
+}
+
 // 统一调度入口：解析参数、校验类型、捕获异常并返回字符串给模型
 export async function executeTool(name: string, rawArgs: string): Promise<string> {
   let args: Record<string, unknown>;
@@ -230,6 +283,18 @@ export async function executeTool(name: string, rawArgs: string): Promise<string
           ? args['dirPath'].trim()
           : '.';
       return await searchText(query.trim(), dirPath);
+    }
+
+    if (name === 'write_file') {
+      const filePath = args['filePath'];
+      if (typeof filePath !== 'string' || !filePath.trim()) {
+        return '工具参数错误：write_file 必须提供非空字符串 filePath';
+      }
+      const content = args['content'];
+      if (typeof content !== 'string') {
+        return '工具参数错误：write_file 必须提供字符串类型的 content';
+      }
+      return await writeFileContent(filePath.trim(), content);
     }
 
     return `未知工具：${name}`;
