@@ -17,7 +17,7 @@ export async function runAgentTurn(options: RunAgentOptions): Promise<void> {
       model,
       instructions,
       input: history,
-      tools: toolDefinitions, // 把工具“菜单”交给模型
+      tools: toolDefinitions, // 把工具菜单给模型
       stream: true,
       store: false,
     });

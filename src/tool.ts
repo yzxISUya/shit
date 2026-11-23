@@ -88,16 +88,17 @@ export const toolDefinitions: OpenAI.Responses.FunctionTool[] = [
 
 const WORKSPACE_ROOT = path.resolve(process.cwd());
 
-function isBlockedSegment(segment: string): boolean {
+const IGNORED_DIRS = new Set(['node_modules', '.git']);
+
+function isSecretSegment(segment: string): boolean {
   const lower = segment.toLowerCase();
-  // 拦截 .env 及 .env.local 等私密文件，但放行公开模板 .env.example
-  if (lower === '.env' || (lower.startsWith('.env.') && lower !== '.env.example')) {
-    return true;
-  }
-  return false;
+  return lower === '.env' || (lower.startsWith('.env.') && lower !== '.env.example');
 }
 
-export function resolveSafePath(inputPath: string): string {
+export function resolveSafePath(
+  inputPath: string,
+  mode: 'read' | 'write' = 'read',
+): string {
   const resolved = path.resolve(WORKSPACE_ROOT, inputPath);
   const relative = path.relative(WORKSPACE_ROOT, resolved);
   if (
@@ -108,10 +109,16 @@ export function resolveSafePath(inputPath: string): string {
     throw new Error(`安全拦截：不允许访问工作区之外的路径 (${inputPath})`);
   }
 
-  const segments = relative.split(path.sep);
-  if (segments.some(isBlockedSegment)) {
-    throw new Error(`安全拦截：不允许访问敏感路径 (${inputPath})`);
+  if (relative !== '') {
+    const segments = relative.split(path.sep);
+    if (segments.some(isSecretSegment)) {
+      throw new Error(`安全拦截：不允许访问敏感环境变量文件 (${inputPath})`);
+    }
+    if (mode === 'write' && segments.some((s) => IGNORED_DIRS.has(s.toLowerCase()))) {
+      throw new Error(`安全拦截：不允许直接修改受保护目录 (${inputPath})`);
+    }
   }
+
   return resolved;
 }
 
@@ -120,7 +127,7 @@ async function listDir(dirPath: string): Promise<string> {
   const entries = await fs.readdir(targetDir, { withFileTypes: true });
 
   const lines = entries
-    .filter((entry) => !isBlockedSegment(entry.name))
+    .filter((entry) => !isSecretSegment(entry.name))
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name));
 
@@ -175,7 +182,7 @@ async function searchText(query: string, dirPath: string): Promise<string> {
       if (matches.length >= MAX_SEARCH_RESULTS) {
         return;
       }
-      if (isBlockedSegment(entry.name)) {
+      if (isSecretSegment(entry.name)) {
         continue;
       }
 
